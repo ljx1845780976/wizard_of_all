@@ -1,0 +1,6 @@
+.claude/
+node_modules/
+miniprogram_npm/
+*.log
+.DS_Store
+project.private.config.json
