@@ -151,9 +151,6 @@ function goRoom(roomId, isOwner) {
     wx.cloud.callFunction({ name: "leaveRoom", data: { roomId: roomId } });
     goLobby();
   });
-  function callAITurn() {
-    wx.cloud.callFunction({ name: "aiTurn", data: { roomId: roomId } });
-  }
   scene.on("startGame", function () {
     console.log('>>> startGame clicked');
     wx.showLoading({ title: '开始中...' });
@@ -163,7 +160,7 @@ function goRoom(roomId, isOwner) {
       success: function (res) {
         console.log('startGame success:', JSON.stringify(res));
         var r = res.result || res;
-        if (r && r.ok) { wx.hideLoading(); callAITurn(); return; }
+        if (r && r.ok) { wx.hideLoading(); return; }
         wx.hideLoading();
         wx.showToast({ title: (r && r.msg) || '开始失败', icon: 'none' });
       },
@@ -181,14 +178,14 @@ function goRoom(roomId, isOwner) {
     wx.cloud.callFunction({
       name: "submitPrediction",
       data: { roomId: roomId, prediction: prediction },
-      success: function () { callAITurn(); }
+      success: function () {}
     });
   });
   scene.on("playCard", function (card) {
     wx.cloud.callFunction({
       name: "playCard",
       data: { roomId: roomId, card: card },
-      success: function () { callAITurn(); }
+      success: function () {}
     });
   });
   scene.on("gameOver", function (room) { goResult(room); });

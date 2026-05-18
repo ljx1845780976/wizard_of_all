@@ -36,6 +36,63 @@ RoomScene.prototype.applyRoomData = function (room, myId) {
   if (room.status === 'finished') {
     this.emit('gameOver', room);
   }
+
+  // 【终极修复】：每次收到服务器的新鲜数据，强制解除心跳锁！
+  this._aiTriggering = false; 
+  this._checkAndTriggerAI();
+};
+// ==================== 核心：前端心跳驱动 AI ====================
+RoomScene.prototype._checkAndTriggerAI = function () {
+  var room = this._room;
+  var myId = this._myId;
+  if (!room || !room.game || room.status !== 'playing') return;
+  
+  // 只让房主充当 AI 的“心脏”，防止 4 个人同时发请求
+  if (room.ownerId !== myId) return;
+
+  var game = room.game;
+  var seats = this._seats;
+  var isAITurn = false;
+
+  // 1. 判断：预测阶段是否轮到电脑
+  if (game.phase === 'predicting') {
+    var submittedPreds = Object.keys(game.predictions || {}).filter(function(k) { return game.predictions[k] !== undefined && game.predictions[k] !== null; });
+    var nextToPredict = (game.predictionOrder || []).find(function(p) { return !submittedPreds.includes(p); });
+    if (!nextToPredict && game.lastPredictor && !submittedPreds.includes(game.lastPredictor)) nextToPredict = game.lastPredictor;
+    
+    var nextSeat = seats.find(function(s) { return s.userId === nextToPredict; });
+    if (nextSeat && nextSeat.isAI) isAITurn = true;
+  } 
+  // 2. 判断：出牌阶段是否轮到电脑
+  else if (game.phase === 'playing') {
+    var trick = game.currentTrick;
+    if (trick) {
+      var played = (trick.cards || []).length;
+      if (played < seats.length) {
+        var leadIdx = seats.findIndex(function(s) { return s.userId === trick.leadPlayer; });
+        if (leadIdx >= 0) {
+          var currentSeat = seats[(leadIdx + played) % seats.length];
+          if (currentSeat && currentSeat.isAI) isAITurn = true;
+        }
+      }
+    }
+  }
+
+  // 3. 唤醒机制 (带 1 秒真实的思考延迟)
+  if (isAITurn) {
+    if (this._aiTriggering) return;
+    this._aiTriggering = true;
+    
+    var docId = room._id || room.roomId || room.roomCode; 
+    setTimeout(function() {
+      wx.cloud.callFunction({
+        name: 'aiTurn',
+        data: { roomId: docId }
+      }).catch(function(err) {
+        console.error('唤醒AI失败', err);
+      });
+    }, 1000); // 1秒思考时间
+  }
 };
 
 RoomScene.prototype.render = function (ctx) {
@@ -48,45 +105,6 @@ RoomScene.prototype.render = function (ctx) {
   var room = this._room;
   if (!room) return;
 
-  // 倒计时 + 超时处理
-  if (room.game && room.game.phaseDeadline) {
-    var now = Date.now();
-    var deadline = room.game.phaseDeadline;
-    var remaining = Math.max(0, Math.ceil((deadline - now) / 1000));
-
-    // 显示倒计时
-    ctx.fillStyle = remaining <= 5 ? '#e74c3c' : 'rgba(255,255,255,0.5)';
-    ctx.font = '18px sans-serif';
-    ctx.textAlign = 'right';
-    ctx.textBaseline = 'top';
-    ctx.fillText(remaining + 's', screenWidth - 14, 64);
-
-    // 超时自动提交
-    if (remaining <= 0 && !this._timeoutFired) {
-      this._timeoutFired = true;
-      var game = room.game;
-      var myId = this._myId;
-      if (game.phase === 'predicting') {
-        var pred = game.predictions && game.predictions[myId];
-        if (pred === undefined || pred === null) {
-          this.emit('submitPrediction', 0);
-        }
-      } else if (game.phase === 'playing' && this._isMyTurn(game, myId)) {
-        var hand = game.hands && game.hands[myId] || [];
-        if (hand.length > 0) {
-          // 出第一张合法牌
-          var card = findFirstLegal(hand, game.currentTrick);
-          if (card) this.emit('playCard', card);
-        }
-      }
-    }
-    // 阶段变化时重置
-    if (this._lastPhase && this._lastPhase !== room.game.phase) {
-      this._timeoutFired = false;
-    }
-    this._lastPhase = room.game.phase;
-  }
-
   if (room.status === 'waiting') {
     this._drawWaiting(ctx);
   } else if (room.status === 'playing' && room.game) {
@@ -97,10 +115,8 @@ RoomScene.prototype.render = function (ctx) {
 // ==================== 顶栏 ====================
 RoomScene.prototype._drawTopBar = function (ctx) {
   var room = this._room;
-
   ctx.fillStyle = 'rgba(0,0,0,0.3)';
   ctx.fillRect(0, 0, screenWidth, 60);
-
   ctx.fillStyle = 'rgba(255,255,255,0.5)';
   ctx.font = '20px sans-serif';
   ctx.textAlign = 'left';
@@ -137,11 +153,10 @@ RoomScene.prototype._drawWaiting = function (ctx) {
   var isOwner = room.ownerId === myId;
   var cx = screenWidth / 2;
 
-  // 修复：改为2x2网格，宽度自适应屏幕
   var maxP = room.maxPlayers || 4;
   var cols = 2; 
   var gap = 16;
-  var seatW = (screenWidth - gap * 3) / 2; // 动态计算宽度
+  var seatW = (screenWidth - gap * 3) / 2; 
   var seatH = 120;
   var gridW = cols * seatW + (cols - 1) * gap;
   var startX = (screenWidth - gridW) / 2;
@@ -168,10 +183,9 @@ RoomScene.prototype._drawWaiting = function (ctx) {
 
     if (slot) {
       ctx.fillStyle = '#ffffff';
-      ctx.font = '18px sans-serif'; // 缩小字体防溢出
+      ctx.font = '18px sans-serif'; 
       ctx.textAlign = 'center';
       ctx.textBaseline = 'top';
-      // 截断过长的名字
       var nick = slot.nickname || '玩家';
       if (nick.length > 5) nick = nick.substring(0, 5) + '..';
       ctx.fillText(nick, sx + seatW / 2, sy + 30);
@@ -187,17 +201,16 @@ RoomScene.prototype._drawWaiting = function (ctx) {
         ctx.fillText('房主', sx + seatW / 2, sy + 72);
       }
 
-	      if (slot.isAI) {
-	        ctx.fillStyle = "rgba(255,200,0,0.2)";
-	        drawRoundRect(ctx, sx + seatW / 2 - 26, sy + 86, 52, 20, 6);
-	        ctx.fill();
-	        ctx.fillStyle = "#FFC107";
-	        ctx.font = "12px sans-serif";
-	        ctx.textAlign = "center";
-	        ctx.textBaseline = "middle";
-	        ctx.fillText("电脑", sx + seatW / 2, sy + 96);
-	      } else
-      if (slot.isReady) {
+      if (slot.isAI) {
+        ctx.fillStyle = "rgba(255,200,0,0.2)";
+        drawRoundRect(ctx, sx + seatW / 2 - 26, sy + 86, 52, 20, 6);
+        ctx.fill();
+        ctx.fillStyle = "#FFC107";
+        ctx.font = "12px sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText("电脑", sx + seatW / 2, sy + 96);
+      } else if (slot.isReady) {
         ctx.fillStyle = 'rgba(46,204,113,0.2)';
         drawRoundRect(ctx, sx + seatW / 2 - 26, sy + 86, 52, 20, 6);
         ctx.fill();
@@ -230,18 +243,18 @@ RoomScene.prototype._drawWaiting = function (ctx) {
 
   if (isOwner) {
     var filled = seats.filter(function (s) { return s; }).length;
-    var allReady = seats.filter(function (s) { return s; }).every(function (s) { return s.isReady; });
+    // 【核心修复】：电脑直接视作已准备
+    var allReady = seats.filter(function (s) { return s; }).every(function (s) { return s.isReady || s.isAI; });
     var canStart = filled >= 3 && allReady;
     var label = canStart ? '开始游戏' : (filled < 3 ? '等待玩家 (' + filled + '/' + maxP + ')' : '等待准备');
     drawButton(ctx, cx - 120, btnY, 240, 56, label, { bg: canStart ? '#667eea' : '#333355' });
     if (canStart) this._hitAreas.push({ x: cx - 120, y: btnY, w: 240, h: 56, action: 'startGame' });
-  } else if (mySlot) {
+  } else if (mySlot && !mySlot.isAI) {
     var readyLabel = mySlot.isReady ? '取消准备' : '准备';
     drawButton(ctx, cx - 120, btnY, 240, 56, readyLabel, { bg: mySlot.isReady ? '#444466' : '#667eea' });
     this._hitAreas.push({ x: cx - 120, y: btnY, w: 240, h: 56, action: 'readyToggle' });
   }
 
-  // 添加电脑按钮（房主可见，有空位时显示）
   if (isOwner) {
     var emptyCount = maxP - seats.filter(function (s) { return s; }).length;
     if (emptyCount > 0) {
@@ -260,9 +273,15 @@ RoomScene.prototype._drawPlaying = function (ctx) {
   var seats = this._seats;
   var cx = screenWidth / 2;
 
+  // ---- 顺序预测权限计算 【核心修复】 ----
+  var submittedPreds = Object.keys(game.predictions || {}).filter(function(k) { return game.predictions[k] !== undefined && game.predictions[k] !== null; });
+  var nextToPredict = (game.predictionOrder || []).find(function(p) { return !submittedPreds.includes(p); });
+  if (!nextToPredict && game.lastPredictor && !submittedPreds.includes(game.lastPredictor)) nextToPredict = game.lastPredictor;
+  var isMyPredictTurn = (nextToPredict === myId);
+
   // ---- 对手区 ----
   var others = seats.filter(function (s) { return s.userId !== myId; });
-  var oppW = Math.min(120, (screenWidth - 24) / Math.max(others.length, 1)); // 动态缩小对手框
+  var oppW = Math.min(120, (screenWidth - 24) / Math.max(others.length, 1)); 
   var oppStartX = (screenWidth - (others.length * oppW + (others.length - 1) * 8)) / 2;
 
   others.forEach(function (s, i) {
@@ -289,7 +308,7 @@ RoomScene.prototype._drawPlaying = function (ctx) {
     ctx.fillText('分:' + scr + ' 测:' + pred + ' 赢:' + won, x + oppW/2, y + 34);
   });
 
-  // ---- 牌桌 (当前出牌) ----
+  // ---- 牌桌 ----
   if (game.currentTrick && game.currentTrick.cards && game.currentTrick.cards.length > 0) {
     var trickCards = game.currentTrick.cards;
     var trickY = 160;
@@ -299,7 +318,6 @@ RoomScene.prototype._drawPlaying = function (ctx) {
     trickCards.forEach(function (c, i) {
       var tx = startX + i * (trickCardWidth + 8);
       drawCard(ctx, tx, trickY, trickCardWidth, trickCardWidth * 1.45, c.suit, c.rank);
-
       var seat = seats.find(function (s) { return s.userId === c.userId; });
       ctx.fillStyle = 'rgba(255,255,255,0.6)';
       ctx.font = '12px sans-serif';
@@ -313,7 +331,16 @@ RoomScene.prototype._drawPlaying = function (ctx) {
   var phaseText = '';
   if (game.phase === 'predicting') {
     var myPred = game.predictions && game.predictions[myId];
-    phaseText = (myPred !== undefined && myPred !== null) ? '等待其他玩家预测...' : '预测你能赢几墩';
+    if (myPred === undefined || myPred === null) {
+      if (isMyPredictTurn) {
+        phaseText = '请预测你能赢几墩';
+      } else {
+        var nextSeat = seats.find(function(s) { return s.userId === nextToPredict; });
+        phaseText = '等待 ' + (nextSeat ? nextSeat.nickname : '玩家') + ' 预测...';
+      }
+    } else {
+      phaseText = '等待其他玩家预测...';
+    }
   } else if (game.phase === 'playing') {
     phaseText = this._isMyTurn(game, myId) ? '轮到你了！' : '等待出牌...';
   } else if (game.phase === 'round_result') {
@@ -326,16 +353,12 @@ RoomScene.prototype._drawPlaying = function (ctx) {
   ctx.textAlign = 'center';
   ctx.fillText(phaseText, cx, phaseY);
 
-  // ---- 我的手牌 (修复重叠问题) ----
+  // ---- 我的手牌 ----
   var myHand = (game.hands && game.hands[myId]) || [];
   var handY = screenHeight - cardHeight - 20;
-  
-  // 核心修复：根据牌的数量自动调整间距（叠牌）
   var maxHandArea = screenWidth - 20;
   var currentGap = cardWidth + 5; 
-  if (myHand.length > 1) {
-    currentGap = Math.min(currentGap, (maxHandArea - cardWidth) / (myHand.length - 1));
-  }
+  if (myHand.length > 1) currentGap = Math.min(currentGap, (maxHandArea - cardWidth) / (myHand.length - 1));
   var totalHandW = (myHand.length - 1) * currentGap + cardWidth;
   var handStartX = (screenWidth - totalHandW) / 2;
   var isMyTurn = this._isMyTurn(game, myId);
@@ -343,8 +366,6 @@ RoomScene.prototype._drawPlaying = function (ctx) {
   myHand.forEach(function (c, i) {
     var hx = handStartX + i * currentGap;
     var playable = isMyTurn && game.phase === 'playing' && canPlayCard(c, game, myId);
-    
-    // 如果是最后一张牌，可点击区域是整张牌；否则只是露出来的边缘宽度
     var hitWidth = (i === myHand.length - 1) ? cardWidth : currentGap;
 
     drawCard(ctx, hx, handY, cardWidth, cardHeight, c.suit, c.rank, { playable: playable });
@@ -353,8 +374,8 @@ RoomScene.prototype._drawPlaying = function (ctx) {
     }
   }.bind(this));
 
-  // ---- 预测选择器 (修复超出屏幕问题) ----
-  if (game.phase === 'predicting') {
+  // ---- 预测选择器 ----
+  if (game.phase === 'predicting' && isMyPredictTurn) {
     var pred = game.predictions && game.predictions[myId];
     if (pred === undefined || pred === null) {
       this._drawPredictionPicker(ctx, game, myId, myHand.length);
@@ -366,8 +387,6 @@ RoomScene.prototype._drawPlaying = function (ctx) {
     this._drawRoundResult(ctx, game);
   }
 };
-
-// ==================== 辅助 ====================
 
 RoomScene.prototype._isMyTurn = function (game, myId) {
   if (game.phase !== 'playing') return false;
@@ -391,19 +410,16 @@ function canPlayCard(card, game, myId) {
   return true;
 }
 
-// 核心修复：预测选择器自动换行
 RoomScene.prototype._drawPredictionPicker = function (ctx, game, myId, handSize) {
   var numSize = 50, numGap = 10;
   var options = [];
   for (var n = 0; n <= handSize; n++) options.push(n);
 
-  // 计算最大列数和行数
   var maxCols = Math.floor((screenWidth - 40) / (numSize + numGap));
   var totalRows = Math.ceil(options.length / maxCols);
   
-  // 整体居中计算
   var pickerAreaH = totalRows * numSize + (totalRows - 1) * numGap;
-  var pickerY = screenHeight - cardHeight - pickerAreaH - 40; // 放在手牌上方
+  var pickerY = screenHeight - cardHeight - pickerAreaH - 40; 
   var cx = screenWidth / 2;
   var forbidden = game.forbiddenPrediction;
 
@@ -411,7 +427,6 @@ RoomScene.prototype._drawPredictionPicker = function (ctx, game, myId, handSize)
     var col = i % maxCols;
     var row = Math.floor(i / maxCols);
     
-    // 让最后一行自动居中对齐
     var currentRowItems = (row === totalRows - 1 && options.length % maxCols !== 0) ? options.length % maxCols : maxCols;
     var rowW = currentRowItems * numSize + (currentRowItems - 1) * numGap;
     var startX = (screenWidth - rowW) / 2;
@@ -465,8 +480,6 @@ RoomScene.prototype._drawRoundResult = function (ctx, game) {
     ctx.fillStyle = score >= 0 ? '#2ecc71' : '#e74c3c';
     ctx.font = '18px sans-serif';
     ctx.textAlign = 'center';
-    
-    // 缩短文字以适应手机屏幕
     var txt = s.nickname.substring(0,4) + ' | 测' + pred + '赢' + actual + ' | ' + sign + score + '分';
     ctx.fillText(txt, cx, y);
   });
@@ -477,13 +490,10 @@ RoomScene.prototype._drawRoundResult = function (ctx, game) {
   }
 };
 
-// ==================== 触摸事件 ====================
-
 RoomScene.prototype.onTouchEnd = function (e) {
   var t = e.changedTouches && e.changedTouches[0];
   if (!t) return;
   var x = t.clientX, y = t.clientY;
-  // 反向遍历 hitAreas，确保重叠时（比如手牌）点到的是最上面的一张
   for (var i = this._hitAreas.length - 1; i >= 0; i--) {
     var h = this._hitAreas[i];
     if (x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h) {
@@ -502,13 +512,3 @@ RoomScene.prototype.onTouchEnd = function (e) {
 RoomScene.prototype.onTouchStart = function () {};
 
 module.exports = RoomScene;
-
-function findFirstLegal(hand, trick) {
-  if (!trick || !trick.leadSuit) return hand[0];
-  var legal = hand.filter(function (c) {
-    if (c.suit === "human" || c.suit === "ant") return true;
-    if (c.suit === trick.leadSuit) return true;
-    return !hand.some(function (h) { return h.suit === trick.leadSuit && h.suit !== "human" && h.suit !== "ant"; });
-  });
-  return legal[0] || hand[0];
-}
